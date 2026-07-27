@@ -44,17 +44,29 @@ import {
   useState,
 } from "react";
 import { WeatherMap } from "./WeatherMap";
+import {
+  calculateTripScore,
+  DEFAULT_TRAVEL_PREFERENCES,
+  isBetterScore,
+  normalizeTravelPreferences,
+  preferencesFor,
+  TRAVEL_PRESETS,
+} from "../lib/trip-score";
 import type {
   Location,
   StoredState,
+  TravelPreferences,
+  TravelStyle,
   TripPlan,
+  TripScore,
   UnitSystem,
   WeatherSnapshot,
 } from "../types";
 
 export type AppMode = "home" | "destination" | "compare" | "saved";
 
-const STORAGE_KEY = "roamcast:v1";
+const STORAGE_KEY = "roamcast:v2";
+const LEGACY_STORAGE_KEY = "roamcast:v1";
 const LISBON: Location = {
   id: "38.7223,-9.1393",
   name: "Lisbon",
@@ -82,12 +94,13 @@ const REYKJAVIK: Location = {
 };
 
 const EMPTY_STATE: StoredState = {
-  version: 1,
+  version: 2,
   unit: "metric",
   favorites: [],
   recent: [],
   compare: [],
   trips: [],
+  travelPreferences: DEFAULT_TRAVEL_PREFERENCES,
 };
 
 const WEATHER_LABELS: Array<[number, string, LucideIcon]> = [
@@ -112,6 +125,26 @@ function weatherMeta(code: number): { label: string; Icon: LucideIcon } {
 
 function toFahrenheit(celsius: number) {
   return (celsius * 9) / 5 + 32;
+}
+
+function toCelsius(fahrenheit: number) {
+  return ((fahrenheit - 32) * 5) / 9;
+}
+
+function toInches(millimetres: number) {
+  return millimetres / 25.4;
+}
+
+function toMillimetres(inches: number) {
+  return inches * 25.4;
+}
+
+function toMph(kilometresPerHour: number) {
+  return kilometresPerHour * 0.621371;
+}
+
+function toKilometresPerHour(milesPerHour: number) {
+  return milesPerHour / 0.621371;
 }
 
 function temperature(value: number, unit: UnitSystem, sign = true) {
@@ -180,13 +213,38 @@ function dateInput(offset = 0) {
   return value.toISOString().slice(0, 10);
 }
 
+function normalizeStoredState(value: unknown): StoredState {
+  if (!value || typeof value !== "object") return EMPTY_STATE;
+  const parsed = value as Partial<StoredState> & { trips?: unknown };
+  const travelPreferences = normalizeTravelPreferences(parsed.travelPreferences);
+  const trips = Array.isArray(parsed.trips)
+    ? parsed.trips.map((trip) => ({
+        ...(trip as TripPlan),
+        preferences: normalizeTravelPreferences((trip as Partial<TripPlan>).preferences ?? travelPreferences),
+      }))
+    : [];
+  return {
+    ...EMPTY_STATE,
+    ...parsed,
+    version: 2,
+    trips,
+    travelPreferences,
+  };
+}
+
 function storageRead(): StoredState {
   if (typeof window === "undefined") return EMPTY_STATE;
   try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "");
-    if (parsed?.version === 1) return { ...EMPTY_STATE, ...parsed };
+    const current = localStorage.getItem(STORAGE_KEY);
+    if (current) return normalizeStoredState(JSON.parse(current));
+    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (legacy) {
+      const migrated = normalizeStoredState(JSON.parse(legacy));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+      return migrated;
+    }
   } catch {
-    // Treat malformed or older storage as a fresh local profile.
+    // Treat malformed storage as a fresh local profile.
   }
   return EMPTY_STATE;
 }
@@ -272,6 +330,10 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
   const [mobileNav, setMobileNav] = useState(false);
   const [startDate, setStartDate] = useState(dateInput(1));
   const [endDate, setEndDate] = useState(dateInput(5));
+  const [comparePreferences, setComparePreferences] = useState<TravelPreferences>(
+    DEFAULT_TRAVEL_PREFERENCES,
+  );
+  const [activeTripId, setActiveTripId] = useState<string | null>(null);
   const searchRef = useRef<HTMLDivElement>(null);
 
   const persist = useCallback(
@@ -305,8 +367,11 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
         longitude,
       };
     }
-    const nextState =
-      mode === "compare" && stored.compare.length === 0
+    const savedTrip =
+      mode === "compare" ? stored.trips.find((trip) => trip.id === params.get("trip")) : undefined;
+    const nextState = savedTrip
+      ? { ...stored, compare: savedTrip.locations }
+      : mode === "compare" && stored.compare.length === 0
         ? { ...stored, compare: [LISBON, TOKYO, REYKJAVIK] }
         : stored;
     let cancelled = false;
@@ -314,6 +379,14 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
       if (cancelled) return;
       setState(nextState);
       setActiveLocation(initialLocation);
+      if (mode === "compare") {
+        setComparePreferences(savedTrip?.preferences ?? nextState.travelPreferences);
+        setActiveTripId(savedTrip?.id ?? null);
+        if (savedTrip) {
+          setStartDate(savedTrip.startDate);
+          setEndDate(savedTrip.endDate);
+        }
+      }
       setHydrated(true);
     });
     return () => {
@@ -701,15 +774,35 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
             unit={unit}
             startDate={startDate}
             endDate={endDate}
+            preferences={comparePreferences}
+            activeTripId={activeTripId}
             onStartDate={setStartDate}
             onEndDate={setEndDate}
+            onPreferencesChange={setComparePreferences}
+            onSavePreferencesAsDefault={() =>
+              persist((previous) => ({
+                ...previous,
+                travelPreferences: comparePreferences,
+              }))
+            }
+            onUpdateTrip={(preferences) => {
+              if (!activeTripId) return;
+              setComparePreferences(preferences);
+              persist((previous) => ({
+                ...previous,
+                trips: previous.trips.map((trip) =>
+                  trip.id === activeTripId ? { ...trip, preferences } : trip,
+                ),
+              }));
+            }}
             onRemove={removeCompare}
-            onSaveTrip={(trip) =>
+            onSaveTrip={(trip) => {
+              setActiveTripId(trip.id);
               persist((previous) => ({
                 ...previous,
                 trips: [trip, ...previous.trips].slice(0, 12),
-              }))
-            }
+              }));
+            }}
           />
         ) : (
           <ForecastView
@@ -1060,6 +1153,205 @@ function ForecastView({
   );
 }
 
+const PROFILE_LABELS: Record<TravelStyle, string> = {
+  beach: "Beach",
+  city: "City",
+  outdoors: "Outdoors",
+  winter: "Winter",
+  custom: "Custom",
+};
+
+function TravelPreferencesPanel({
+  preferences,
+  unit,
+  activeTripId,
+  onChange,
+  onSaveDefault,
+  onUpdateTrip,
+}: {
+  preferences: TravelPreferences;
+  unit: UnitSystem;
+  activeTripId: string | null;
+  onChange: (preferences: TravelPreferences) => void;
+  onSaveDefault: () => void;
+  onUpdateTrip: (preferences: TravelPreferences) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const update = (next: Partial<TravelPreferences>) =>
+    onChange(normalizeTravelPreferences({ ...preferences, ...next, style: "custom" }));
+  const updateWeight = (factor: keyof TravelPreferences["weights"], value: number) =>
+    update({ weights: { ...preferences.weights, [factor]: value } });
+  const temperatureValue = (value: number) =>
+    unit === "imperial" ? Math.round(toFahrenheit(value)) : Math.round(value);
+  const rainValue = (value: number) =>
+    unit === "imperial" ? Number(toInches(value).toFixed(1)) : Math.round(value);
+  const windValue = (value: number) =>
+    unit === "imperial" ? Math.round(toMph(value)) : Math.round(value);
+
+  return (
+    <section className="preferences-panel" aria-label="Travel preferences">
+      <div className="preferences-summary">
+        <div>
+          <span className="section-kicker">Personalize the ranking</span>
+          <h2>Your travel preferences</h2>
+          <p>
+            {PROFILE_LABELS[preferences.style]} profile · planning guidance,
+            not an official warning.
+          </p>
+        </div>
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={open}
+        >
+          <Sparkles size={17} /> {open ? "Hide settings" : "Customize score"}
+        </button>
+      </div>
+      {open && (
+        <div className="preferences-controls">
+          <fieldset>
+            <legend>Start with a travel style</legend>
+            <div className="profile-options">
+              {(Object.keys(TRAVEL_PRESETS) as Array<Exclude<TravelStyle, "custom">>).map(
+                (style) => (
+                  <button
+                    type="button"
+                    key={style}
+                    className={preferences.style === style ? "selected" : ""}
+                    onClick={() => onChange(preferencesFor(style))}
+                  >
+                    {PROFILE_LABELS[style]}
+                  </button>
+                ),
+              )}
+            </div>
+          </fieldset>
+          <div className="preference-fields">
+            <label>
+              <span>Comfortable from ({unit === "imperial" ? "°F" : "°C"})</span>
+              <input
+                type="number"
+                value={temperatureValue(preferences.temperatureMin)}
+                onChange={(event) =>
+                  update({
+                    temperatureMin:
+                      unit === "imperial"
+                        ? toCelsius(Number(event.target.value))
+                        : Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label>
+              <span>Comfortable to ({unit === "imperial" ? "°F" : "°C"})</span>
+              <input
+                type="number"
+                value={temperatureValue(preferences.temperatureMax)}
+                onChange={(event) =>
+                  update({
+                    temperatureMax:
+                      unit === "imperial"
+                        ? toCelsius(Number(event.target.value))
+                        : Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label>
+              <span>Daily rain ({unit === "imperial" ? "in" : "mm"})</span>
+              <input
+                type="number"
+                step={unit === "imperial" ? "0.1" : "1"}
+                value={rainValue(preferences.precipitationTolerance)}
+                onChange={(event) =>
+                  update({
+                    precipitationTolerance:
+                      unit === "imperial"
+                        ? toMillimetres(Number(event.target.value))
+                        : Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label>
+              <span>Wind gusts ({unit === "imperial" ? "mph" : "km/h"})</span>
+              <input
+                type="number"
+                value={windValue(preferences.windGustTolerance)}
+                onChange={(event) =>
+                  update({
+                    windGustTolerance:
+                      unit === "imperial"
+                        ? toKilometresPerHour(Number(event.target.value))
+                        : Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label>
+              <span>UV tolerance</span>
+              <input
+                type="number"
+                min="0"
+                max="11"
+                value={preferences.uvTolerance}
+                onChange={(event) => update({ uvTolerance: Number(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>Preferred conditions</span>
+              <select
+                value={preferences.preferredCondition}
+                onChange={(event) =>
+                  update({
+                    preferredCondition: event.target
+                      .value as TravelPreferences["preferredCondition"],
+                  })
+                }
+              >
+                <option value="sunny">Sunny</option>
+                <option value="balanced">Balanced</option>
+                <option value="snowy">Snow-friendly</option>
+              </select>
+            </label>
+          </div>
+          <fieldset>
+            <legend>What matters most?</legend>
+            <div className="weight-controls">
+              {(["temperature", "rain", "wind", "uv", "conditions"] as const).map(
+                (factor) => (
+                  <label key={factor}>
+                    <span>{factor === "uv" ? "UV" : factor[0].toUpperCase() + factor.slice(1)}</span>
+                    <select
+                      value={preferences.weights[factor]}
+                      onChange={(event) => updateWeight(factor, Number(event.target.value))}
+                    >
+                      <option value="1">Low</option>
+                      <option value="2">Standard</option>
+                      <option value="3">Priority</option>
+                    </select>
+                  </label>
+                ),
+              )}
+            </div>
+          </fieldset>
+          <div className="preference-actions">
+            <button type="button" className="secondary-button" onClick={onSaveDefault}>
+              Save as my default
+            </button>
+            {activeTripId && (
+              <button type="button" className="primary-button" onClick={() => onUpdateTrip(preferences)}>
+                Update saved trip
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function CompareView({
   locations,
   snapshots,
@@ -1067,8 +1359,13 @@ function CompareView({
   unit,
   startDate,
   endDate,
+  preferences,
+  activeTripId,
   onStartDate,
   onEndDate,
+  onPreferencesChange,
+  onSavePreferencesAsDefault,
+  onUpdateTrip,
   onRemove,
   onSaveTrip,
 }: {
@@ -1078,8 +1375,13 @@ function CompareView({
   unit: UnitSystem;
   startDate: string;
   endDate: string;
+  preferences: TravelPreferences;
+  activeTripId: string | null;
   onStartDate: (value: string) => void;
   onEndDate: (value: string) => void;
+  onPreferencesChange: (preferences: TravelPreferences) => void;
+  onSavePreferencesAsDefault: () => void;
+  onUpdateTrip: (preferences: TravelPreferences) => void;
   onRemove: (id: string) => void;
   onSaveTrip: (trip: TripPlan) => void;
 }) {
@@ -1096,6 +1398,25 @@ function CompareView({
       temperature(snapshot.current.temperature, unit),
     ]),
   );
+  const comparisons = snapshots.map((snapshot) => {
+    const days = withinRange
+      ? snapshot.daily.filter((day) => day.date >= startDate && day.date <= endDate)
+      : [];
+    return {
+      snapshot,
+      days,
+      score: calculateTripScore(days, snapshot.risks, preferences),
+    };
+  });
+  const best = comparisons.reduce<
+    { snapshot: WeatherSnapshot; days: WeatherSnapshot["daily"]; score: TripScore | null } | null
+  >(
+    (current, candidate) =>
+      candidate.score && (!current?.score || isBetterScore(candidate.score, current.score))
+        ? candidate
+        : current,
+    null,
+  );
 
   const saveTrip = () => {
     onSaveTrip({
@@ -1105,6 +1426,7 @@ function CompareView({
       startDate,
       endDate,
       createdAt: new Date().toISOString(),
+      preferences,
     });
     setSaved(true);
     window.setTimeout(() => setSaved(false), 2200);
@@ -1155,14 +1477,23 @@ function CompareView({
         </div>
       </section>
 
+      <TravelPreferencesPanel
+        preferences={preferences}
+        unit={unit}
+        activeTripId={activeTripId}
+        onChange={onPreferencesChange}
+        onSaveDefault={onSavePreferencesAsDefault}
+        onUpdateTrip={onUpdateTrip}
+      />
+
       {!withinRange && (
         <div className="range-notice">
           <CalendarDays size={19} />
           <div>
             <strong>Live forecast not available yet</strong>
             <p>
-              Save this trip now. Forecasts appear when the dates enter the
-              16-day live window.
+              Save this trip now. Trip Score appears when the dates enter the
+              16-day live forecast window.
             </p>
           </div>
         </div>
@@ -1201,15 +1532,19 @@ function CompareView({
         />
       ) : (
         <section className="compare-grid">
-          {snapshots.map((snapshot, index) => {
+          {comparisons.map(({ snapshot, days: selectedDays, score }, index) => {
             const meta = weatherMeta(snapshot.current.weatherCode);
-            const selectedDays = withinRange
-              ? snapshot.daily.filter(
-                  (day) => day.date >= startDate && day.date <= endDate,
-                )
-              : [];
+            const isBest = best?.snapshot.location.id === snapshot.location.id;
             return (
-              <article className={`compare-card card-${index + 1}`} key={snapshot.location.id}>
+              <article
+                className={`compare-card card-${index + 1} ${isBest ? "best-match" : ""}`}
+                key={snapshot.location.id}
+              >
+                {isBest && (
+                  <span className="best-match-badge">
+                    <Sparkles size={13} /> Best match
+                  </span>
+                )}
                 <div className="compare-card-head">
                   <div>
                     <span>
@@ -1240,6 +1575,25 @@ function CompareView({
                     <Wind size={15} /> {speed(snapshot.current.windSpeed, unit)}
                   </span>
                 </div>
+                {score ? (
+                  <div
+                    className={`trip-score score-${score.label
+                      .toLowerCase()
+                      .replace(" ", "-")}`}
+                  >
+                    <div>
+                      <span>Trip Score</span>
+                      <strong>{score.value}</strong>
+                      <small>out of 100 — {score.label}</small>
+                    </div>
+                    <p>{score.reasons.map((reason) => reason.label).join(". ")}</p>
+                  </div>
+                ) : (
+                  <div className="trip-score unavailable">
+                    <span>Trip Score unavailable</span>
+                    <p>Choose dates within the live forecast window to see a personal ranking.</p>
+                  </div>
+                )}
                 {selectedDays.length > 0 ? (
                   <div className="compare-days">
                     {selectedDays.slice(0, 6).map((day) => (
@@ -1388,10 +1742,19 @@ function SavedView({
                         <span key={place.id}>{place.name}</span>
                       ))}
                     </div>
+                    <p className="trip-profile">
+                      {PROFILE_LABELS[trip.preferences.style]} travel profile
+                    </p>
                   </div>
                   <span className={isLive ? "trip-status live" : "trip-status"}>
                     {isLive ? "Live forecast ready" : "Waiting for forecast window"}
                   </span>
+                  <Link
+                    className="trip-open"
+                    href={`/compare?trip=${encodeURIComponent(trip.id)}`}
+                  >
+                    Open <ArrowRight size={15} />
+                  </Link>
                   <button
                     type="button"
                     className="icon-button"

@@ -80,6 +80,41 @@ export type SavedPlace = Location & {
   savedAt: string;
 };
 
+export type TravelStyle = "beach" | "city" | "outdoors" | "winter" | "custom";
+
+export type PreferenceWeight = 1 | 2 | 3;
+
+export type TravelPreferences = {
+  style: TravelStyle;
+  temperatureMin: number;
+  temperatureMax: number;
+  precipitationTolerance: number;
+  windGustTolerance: number;
+  uvTolerance: number;
+  preferredCondition: "sunny" | "balanced" | "snowy";
+  weights: {
+    temperature: PreferenceWeight;
+    rain: PreferenceWeight;
+    wind: PreferenceWeight;
+    uv: PreferenceWeight;
+    conditions: PreferenceWeight;
+  };
+};
+
+export type ScoreReason = {
+  factor: "temperature" | "rain" | "wind" | "uv" | "conditions" | "risk";
+  label: string;
+  impact: number;
+};
+
+export type TripScore = {
+  value: number;
+  label: "Excellent" | "Good" | "Mixed" | "Poor fit";
+  reasons: ScoreReason[];
+  cautionCount: number;
+  totalPrecipitation: number;
+};
+
 export type TripPlan = {
   id: string;
   name: string;
@@ -87,16 +122,17 @@ export type TripPlan = {
   startDate: string;
   endDate: string;
   createdAt: string;
+  preferences: TravelPreferences;
 };
 
 export type StoredState = {
-  version: 1;
+  version: 2;
   unit: UnitSystem;
   favorites: SavedPlace[];
   recent: Location[];
   compare: Location[];
   trips: TripPlan[];
+  travelPreferences: TravelPreferences;
   lastLocation?: Location;
   lastForecast?: WeatherSnapshot;
 };
-
