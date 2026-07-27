@@ -108,7 +108,11 @@ test("ships the planned storage, access, and travel-risk contracts", async () =>
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
 
-  assert.match(client, /roamcast:v1/);
+  assert.match(client, /roamcast:v2/);
+  assert.match(client, /LEGACY_STORAGE_KEY/);
+  assert.match(client, /TravelPreferencesPanel/);
+  assert.match(client, /Trip Score unavailable/);
+  assert.match(client, /compare\?trip=/);
   assert.match(client, /navigator\.geolocation/);
   assert.match(client, /role="combobox"/);
   assert.match(client, /\.slice\(0, 8\)/);
