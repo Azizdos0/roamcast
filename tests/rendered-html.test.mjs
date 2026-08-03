@@ -40,7 +40,7 @@ async function waitForServer(origin, process) {
   throw new Error("Next.js did not become ready within 20 seconds");
 }
 
-test("server-renders all four RoamCast experiences", async () => {
+test("server-renders all RoamCast experiences", async () => {
   const port = await availablePort();
   const origin = `http://127.0.0.1:${port}`;
   const nextBin = resolve(projectRoot, "node_modules", "next", "dist", "bin", "next");
@@ -58,16 +58,19 @@ test("server-renders all four RoamCast experiences", async () => {
     await waitForServer(origin, server);
 
     const cases = [
-      ["/", /Reading the skies/],
+      ["/", /Reading the skies/, true],
       [
         "/destination/lisbon?lat=38.7223&lon=-9.1393&name=Lisbon&country=Portugal",
         /Reading the skies/,
+        true,
       ],
-      ["/compare", /Find your best forecast/],
-      ["/saved", /Saved for wherever/],
+      ["/explore", /Where should the weather take you/, false],
+      ["/compare", /Find your best forecast/, true],
+      ["/saved", /Saved for wherever/, true],
+      ["/trip/invalid", /trip link is not valid/, false],
     ];
 
-    for (const [path, expected] of cases) {
+    for (const [path, expected, hasSearch] of cases) {
       const response = await fetch(`${origin}${path}`, {
         headers: { accept: "text/html" },
       });
@@ -76,7 +79,7 @@ test("server-renders all four RoamCast experiences", async () => {
       const html = await response.text();
       assert.match(html, /RoamCast/);
       assert.match(html, expected);
-      assert.match(html, /Search destinations/);
+      if (hasSearch) assert.match(html, /Search destinations/);
     }
 
     const weather = await fetch(`${origin}/api/weather?lat=200&lon=0`);
@@ -94,28 +97,41 @@ test("server-renders all four RoamCast experiences", async () => {
     });
     assert.equal(compare.status, 400);
     assert.deepEqual((await compare.json()).error.code, "INVALID_LOCATIONS");
+
+    const recommendations = await fetch(`${origin}/api/recommendations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(recommendations.status, 400);
+    assert.deepEqual((await recommendations.json()).error.code, "INVALID_REQUEST");
   } finally {
     server.kill();
   }
 });
 
-test("ships the planned storage, access, and travel-risk contracts", async () => {
-  const [client, provider, layout, stylesheet, packageJson] = await Promise.all([
+test("ships the planned storage, access, recommendation, sharing, and travel-risk contracts", async () => {
+  const [client, provider, storage, layout, stylesheet, packageJson, recommendation, sharing] = await Promise.all([
     readFile(new URL("../app/components/RoamCastApp.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/weather.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/storage.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/recommendations/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/share-trip.ts", import.meta.url), "utf8"),
   ]);
 
-  assert.match(client, /roamcast:v2/);
-  assert.match(client, /LEGACY_STORAGE_KEY/);
+  assert.match(storage, /roamcast:v3/);
+  assert.match(storage, /roamcast:v2/);
+  assert.match(storage, /version: 3/);
   assert.match(client, /TravelPreferencesPanel/);
   assert.match(client, /Trip Score unavailable/);
   assert.match(client, /compare\?trip=/);
+  assert.match(client, /Share trip/);
   assert.match(client, /navigator\.geolocation/);
   assert.match(client, /role="combobox"/);
-  assert.match(client, /\.slice\(0, 8\)/);
+  assert.match(storage, /\.slice\(0, 8\)/);
   assert.match(client, /Live forecast not available yet/);
 
   assert.match(provider, /apparentTemperatureMax >= 40/);
@@ -124,6 +140,13 @@ test("ships the planned storage, access, and travel-risk contracts", async () =>
   assert.match(provider, /temperatureMin <= 0/);
   assert.match(provider, /weatherCode >= 95/);
   assert.match(provider, /Math\.min\(16, forecastDays\)/);
+  assert.match(provider, /getDailyWeatherBatch/);
+  assert.match(provider, /uv_index/);
+
+  assert.match(recommendation, /FORECAST_WINDOW_UNAVAILABLE/);
+  assert.match(recommendation, /calculateTripScore/);
+  assert.match(sharing, /MAX_SHARE_CODE_LENGTH = 4096/);
+  assert.match(sharing, /base64/);
 
   assert.match(layout, /openGraph/);
   assert.match(layout, /\/og\.png/);

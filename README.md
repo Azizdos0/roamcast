@@ -12,7 +12,11 @@ just the current temperature.
 
 - Search for places around the world
 - Current weather, hourly conditions, and a 10-day forecast
+- Personalized destination recommendations for live forecast dates
 - Side-by-side comparison for up to three destinations
+- Trip Scores based on your weather preferences
+- Three-hour activity windows and weather-ready packing suggestions
+- Shareable trip briefs that do not require an account
 - Interactive destination maps
 - Saved places, recent searches, and trip plans
 - Metric and imperial units
