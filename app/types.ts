@@ -29,6 +29,7 @@ export type HourlyForecast = {
   time: string;
   temperature: number;
   apparentTemperature: number;
+  uvIndex: number;
   precipitationProbability: number;
   precipitation: number;
   weatherCode: number;
@@ -115,6 +116,68 @@ export type TripScore = {
   totalPrecipitation: number;
 };
 
+export type DestinationRegion =
+  | "europe"
+  | "asia"
+  | "middle-east-africa"
+  | "north-america"
+  | "latin-america-caribbean"
+  | "oceania";
+
+export type ActivityType =
+  | "general"
+  | "beach"
+  | "sightseeing"
+  | "hiking"
+  | "winter";
+
+export type ActivityPlan = {
+  defaultActivity: ActivityType | "auto";
+  destinationOverrides: Record<string, ActivityType>;
+  dayOverrides: Record<string, ActivityType>;
+};
+
+export type WeatherWindow = {
+  start: string;
+  end: string;
+  score: number;
+  label: TripScore["label"];
+  reasons: ScoreReason[];
+  activity: ActivityType;
+  caution: boolean;
+};
+
+export type PackingSuggestion = {
+  id: string;
+  label: string;
+  reason: string;
+};
+
+export type DestinationCatalogEntry = Location & {
+  catalogRegion: DestinationRegion;
+  styles: Array<Exclude<TravelStyle, "custom">>;
+};
+
+export type DestinationRecommendation = {
+  location: Location;
+  score: TripScore;
+  days: DailyForecast[];
+  risks: TravelRisk[];
+};
+
+export type RecommendationRequest = {
+  startDate: string;
+  endDate: string;
+  region: DestinationRegion | "all";
+  preferences: TravelPreferences;
+};
+
+export type RecommendationResponse = {
+  recommendations: DestinationRecommendation[];
+  evaluatedDestinations: number;
+  generatedAt: string;
+};
+
 export type TripPlan = {
   id: string;
   name: string;
@@ -123,10 +186,11 @@ export type TripPlan = {
   endDate: string;
   createdAt: string;
   preferences: TravelPreferences;
+  activityPlan: ActivityPlan;
 };
 
 export type StoredState = {
-  version: 2;
+  version: 3;
   unit: UnitSystem;
   favorites: SavedPlace[];
   recent: Location[];
@@ -135,4 +199,14 @@ export type StoredState = {
   travelPreferences: TravelPreferences;
   lastLocation?: Location;
   lastForecast?: WeatherSnapshot;
+};
+
+export type SharedTripPayloadV1 = {
+  version: 1;
+  name?: string;
+  locations: Location[];
+  startDate: string;
+  endDate: string;
+  preferences: TravelPreferences;
+  activityPlan: ActivityPlan;
 };

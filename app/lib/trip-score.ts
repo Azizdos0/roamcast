@@ -115,12 +115,13 @@ function labelFor(score: number): TripScore["label"] {
 
 function reasonLabel(factor: ScoreReason["factor"], impact: number) {
   const rounded = Math.round(impact);
-  if (factor === "temperature") return `Temperature is ${rounded} points outside your comfort range`;
-  if (factor === "rain") return `Rain is costing ${rounded} points`;
-  if (factor === "wind") return `Wind is costing ${rounded} points`;
-  if (factor === "uv") return `UV is costing ${rounded} points`;
-  if (factor === "conditions") return `Forecast conditions are costing ${rounded} points`;
-  return `Travel risks are costing ${rounded} points`;
+  const points = `${rounded} ${rounded === 1 ? "point" : "points"}`;
+  if (factor === "temperature") return `Temperature is ${points} outside your comfort range`;
+  if (factor === "rain") return `Rain is costing ${points}`;
+  if (factor === "wind") return `Wind is costing ${points}`;
+  if (factor === "uv") return `UV is costing ${points}`;
+  if (factor === "conditions") return `Forecast conditions are costing ${points}`;
+  return `Travel risks are costing ${points}`;
 }
 
 export function calculateTripScore(
@@ -164,7 +165,14 @@ export function calculateTripScore(
     .filter(([, impact]) => impact > 1)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 2)
-    .map(([factor, impact]) => ({ factor, impact: Math.round(impact / (factor === "risk" ? 1 : days.length)), label: reasonLabel(factor, impact / (factor === "risk" ? 1 : days.length)) }));
+    .map(([factor, impact]) => {
+      const normalizedImpact = Math.max(1, impact / (factor === "risk" ? 1 : days.length));
+      return {
+        factor,
+        impact: Math.round(normalizedImpact),
+        label: reasonLabel(factor, normalizedImpact),
+      };
+    });
   return {
     value: score,
     label: labelFor(score),

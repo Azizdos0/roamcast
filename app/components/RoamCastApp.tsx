@@ -24,6 +24,7 @@ import {
   Navigation,
   Plus,
   Search,
+  Share2,
   Snowflake,
   Sparkles,
   Sun,
@@ -44,6 +45,8 @@ import {
   useState,
 } from "react";
 import { WeatherMap } from "./WeatherMap";
+import { ExploreView } from "./ExploreView";
+import { PackingList, WeatherWindowsPanel } from "./WeatherWindowsPanel";
 import {
   calculateTripScore,
   DEFAULT_TRAVEL_PREFERENCES,
@@ -52,7 +55,18 @@ import {
   preferencesFor,
   TRAVEL_PRESETS,
 } from "../lib/trip-score";
+import { encodeSharedTrip } from "../lib/share-trip";
+import {
+  EMPTY_ACTIVITY_PLAN,
+  ACTIVITY_LABELS,
+} from "../lib/weather-window";
+import {
+  EMPTY_STORED_STATE,
+  readStoredState,
+  writeStoredState,
+} from "../lib/storage";
 import type {
+  ActivityPlan,
   Location,
   StoredState,
   TravelPreferences,
@@ -63,10 +77,8 @@ import type {
   WeatherSnapshot,
 } from "../types";
 
-export type AppMode = "home" | "destination" | "compare" | "saved";
+export type AppMode = "home" | "destination" | "compare" | "saved" | "explore";
 
-const STORAGE_KEY = "roamcast:v2";
-const LEGACY_STORAGE_KEY = "roamcast:v1";
 const LISBON: Location = {
   id: "38.7223,-9.1393",
   name: "Lisbon",
@@ -93,15 +105,7 @@ const REYKJAVIK: Location = {
   timezone: "Atlantic/Reykjavik",
 };
 
-const EMPTY_STATE: StoredState = {
-  version: 2,
-  unit: "metric",
-  favorites: [],
-  recent: [],
-  compare: [],
-  trips: [],
-  travelPreferences: DEFAULT_TRAVEL_PREFERENCES,
-};
+const EMPTY_STATE = EMPTY_STORED_STATE;
 
 const WEATHER_LABELS: Array<[number, string, LucideIcon]> = [
   [0, "Clear sky", Sun],
@@ -213,44 +217,36 @@ function dateInput(offset = 0) {
   return value.toISOString().slice(0, 10);
 }
 
-function normalizeStoredState(value: unknown): StoredState {
-  if (!value || typeof value !== "object") return EMPTY_STATE;
-  const parsed = value as Partial<StoredState> & { trips?: unknown };
-  const travelPreferences = normalizeTravelPreferences(parsed.travelPreferences);
-  const trips = Array.isArray(parsed.trips)
-    ? parsed.trips.map((trip) => ({
-        ...(trip as TripPlan),
-        preferences: normalizeTravelPreferences((trip as Partial<TripPlan>).preferences ?? travelPreferences),
-      }))
-    : [];
-  return {
-    ...EMPTY_STATE,
-    ...parsed,
-    version: 2,
-    trips,
-    travelPreferences,
-  };
-}
-
-function storageRead(): StoredState {
-  if (typeof window === "undefined") return EMPTY_STATE;
-  try {
-    const current = localStorage.getItem(STORAGE_KEY);
-    if (current) return normalizeStoredState(JSON.parse(current));
-    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
-    if (legacy) {
-      const migrated = normalizeStoredState(JSON.parse(legacy));
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
-      return migrated;
+async function shareTripLink(
+  trip: Pick<
+    TripPlan,
+    "name" | "locations" | "startDate" | "endDate" | "preferences" | "activityPlan"
+  >,
+) {
+  const code = encodeSharedTrip({
+    version: 1,
+    name: trip.name,
+    locations: trip.locations,
+    startDate: trip.startDate,
+    endDate: trip.endDate,
+    preferences: trip.preferences,
+    activityPlan: trip.activityPlan,
+  });
+  const url = `${window.location.origin}/trip/${code}`;
+  if (navigator.share) {
+    try {
+      await navigator.share({
+        title: trip.name || "RoamCast trip brief",
+        text: "Compare this travel-weather plan on RoamCast.",
+        url,
+      });
+      return "Trip shared.";
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return "";
     }
-  } catch {
-    // Treat malformed storage as a fresh local profile.
   }
-  return EMPTY_STATE;
-}
-
-function storageWrite(next: StoredState) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  await navigator.clipboard.writeText(url);
+  return "Share link copied.";
 }
 
 function Stat({
@@ -334,13 +330,16 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
     DEFAULT_TRAVEL_PREFERENCES,
   );
   const [activeTripId, setActiveTripId] = useState<string | null>(null);
+  const [compareActivityPlan, setCompareActivityPlan] = useState<ActivityPlan>(
+    EMPTY_ACTIVITY_PLAN,
+  );
   const searchRef = useRef<HTMLDivElement>(null);
 
   const persist = useCallback(
     (updater: (previous: StoredState) => StoredState) => {
       setState((previous) => {
         const next = updater(previous);
-        storageWrite(next);
+        writeStoredState(next);
         return next;
       });
     },
@@ -348,7 +347,7 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
   );
 
   useEffect(() => {
-    const stored = storageRead();
+    const stored = readStoredState();
     const params = new URLSearchParams(window.location.search);
     const latitude = Number(params.get("lat"));
     const longitude = Number(params.get("lon"));
@@ -381,6 +380,7 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
       setActiveLocation(initialLocation);
       if (mode === "compare") {
         setComparePreferences(savedTrip?.preferences ?? nextState.travelPreferences);
+        setCompareActivityPlan(savedTrip?.activityPlan ?? EMPTY_ACTIVITY_PLAN);
         setActiveTripId(savedTrip?.id ?? null);
         if (savedTrip) {
           setStartDate(savedTrip.startDate);
@@ -395,7 +395,7 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
   }, [mode]);
 
   useEffect(() => {
-    if (!hydrated || mode === "saved" || mode === "compare") return;
+    if (!hydrated || mode === "saved" || mode === "compare" || mode === "explore") return;
     const controller = new AbortController();
     const params = new URLSearchParams({
       lat: String(activeLocation.latitude),
@@ -613,13 +613,16 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
       <header className="site-header">
         <Brand />
         <nav className={mobileNav ? "main-nav open" : "main-nav"}>
-          <Link className={mode === "home" ? "active" : ""} href="/">
+          <Link className={mode === "home" ? "active" : ""} href="/" onClick={() => setMobileNav(false)}>
             Forecast
           </Link>
-          <Link className={mode === "compare" ? "active" : ""} href="/compare">
+          <Link className={mode === "explore" ? "active" : ""} href="/explore" onClick={() => setMobileNav(false)}>
+            Explore
+          </Link>
+          <Link className={mode === "compare" ? "active" : ""} href="/compare" onClick={() => setMobileNav(false)}>
             Compare
           </Link>
-          <Link className={mode === "saved" ? "active" : ""} href="/saved">
+          <Link className={mode === "saved" ? "active" : ""} href="/saved" onClick={() => setMobileNav(false)}>
             Saved
           </Link>
         </nav>
@@ -651,6 +654,7 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
       </header>
 
       <main>
+        {mode !== "explore" && (
         <section className="search-row" aria-label="Destination search">
           <div className="search-wrap" ref={searchRef}>
             <Search size={20} aria-hidden="true" />
@@ -744,6 +748,7 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
             </button>
           )}
         </section>
+        )}
 
         {error && (
           <div className="notice" role="status">
@@ -755,7 +760,39 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
           </div>
         )}
 
-        {mode === "saved" ? (
+        {mode === "explore" ? (
+          <ExploreView
+            hydrated={hydrated}
+            unit={unit}
+            preferences={state.travelPreferences}
+            favorites={state.favorites}
+            compare={state.compare}
+            onPreferencesChange={(preferences) =>
+              setState((previous) => ({ ...previous, travelPreferences: preferences }))
+            }
+            onSaveDefault={(preferences) =>
+              persist((previous) => ({ ...previous, travelPreferences: preferences }))
+            }
+            onToggleFavorite={toggleFavorite}
+            onAddCompare={(place) => {
+              if (state.compare.some((item) => item.id === place.id)) {
+                return `${place.name} is already in your comparison.`;
+              }
+              if (state.compare.length >= 3) {
+                return "Remove a destination from Compare before adding another.";
+              }
+              persist((previous) => ({
+                ...previous,
+                compare: [...previous.compare, place],
+                recent: [
+                  place,
+                  ...previous.recent.filter((item) => item.id !== place.id),
+                ].slice(0, 6),
+              }));
+              return null;
+            }}
+          />
+        ) : mode === "saved" ? (
           <SavedView
             state={state}
             onRemove={(place) => toggleFavorite(place)}
@@ -775,6 +812,7 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
             startDate={startDate}
             endDate={endDate}
             preferences={comparePreferences}
+            activityPlan={compareActivityPlan}
             activeTripId={activeTripId}
             onStartDate={setStartDate}
             onEndDate={setEndDate}
@@ -785,13 +823,17 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
                 travelPreferences: comparePreferences,
               }))
             }
-            onUpdateTrip={(preferences) => {
+            onActivityPlanChange={setCompareActivityPlan}
+            onUpdateTrip={(preferences, activityPlan) => {
               if (!activeTripId) return;
               setComparePreferences(preferences);
+              setCompareActivityPlan(activityPlan);
               persist((previous) => ({
                 ...previous,
                 trips: previous.trips.map((trip) =>
-                  trip.id === activeTripId ? { ...trip, preferences } : trip,
+                  trip.id === activeTripId
+                    ? { ...trip, preferences, activityPlan, startDate, endDate, locations: state.compare }
+                    : trip,
                 ),
               }));
             }}
@@ -810,6 +852,8 @@ export function RoamCastApp({ mode }: { mode: AppMode }) {
             loading={loading}
             unit={unit}
             detailed={mode === "destination"}
+            preferences={state.travelPreferences}
+            activityPlan={EMPTY_ACTIVITY_PLAN}
             favorite={isFavorite}
             onToggleFavorite={() => toggleFavorite(activeLocation)}
           />
@@ -838,6 +882,8 @@ function ForecastView({
   loading,
   unit,
   detailed,
+  preferences,
+  activityPlan,
   favorite,
   onToggleFavorite,
 }: {
@@ -845,6 +891,8 @@ function ForecastView({
   loading: boolean;
   unit: UnitSystem;
   detailed: boolean;
+  preferences: TravelPreferences;
+  activityPlan: ActivityPlan;
   favorite: boolean;
   onToggleFavorite: () => void;
 }) {
@@ -1077,6 +1125,22 @@ function ForecastView({
 
       {detailed && (
         <>
+          <section className="panel destination-windows-panel">
+            <div className="section-heading">
+              <div>
+                <span className="section-kicker">Plan the day</span>
+                <h2>Best times to head outside</h2>
+              </div>
+              <CalendarDays size={21} />
+            </div>
+            <WeatherWindowsPanel
+              snapshot={weather}
+              days={weather.daily.slice(0, 5)}
+              preferences={preferences}
+              activityPlan={activityPlan}
+            />
+            <PackingList snapshot={weather} days={weather.daily.slice(0, 5)} />
+          </section>
           <section className="details-grid">
             <div className="panel map-panel">
               <div className="section-heading">
@@ -1360,10 +1424,12 @@ function CompareView({
   startDate,
   endDate,
   preferences,
+  activityPlan,
   activeTripId,
   onStartDate,
   onEndDate,
   onPreferencesChange,
+  onActivityPlanChange,
   onSavePreferencesAsDefault,
   onUpdateTrip,
   onRemove,
@@ -1376,16 +1442,19 @@ function CompareView({
   startDate: string;
   endDate: string;
   preferences: TravelPreferences;
+  activityPlan: ActivityPlan;
   activeTripId: string | null;
   onStartDate: (value: string) => void;
   onEndDate: (value: string) => void;
   onPreferencesChange: (preferences: TravelPreferences) => void;
+  onActivityPlanChange: (plan: ActivityPlan) => void;
   onSavePreferencesAsDefault: () => void;
-  onUpdateTrip: (preferences: TravelPreferences) => void;
+  onUpdateTrip: (preferences: TravelPreferences, activityPlan: ActivityPlan) => void;
   onRemove: (id: string) => void;
   onSaveTrip: (trip: TripPlan) => void;
 }) {
   const [saved, setSaved] = useState(false);
+  const [shareStatus, setShareStatus] = useState("");
   const forecastEnd = dateInput(15);
   const withinRange =
     startDate >= dateInput(0) &&
@@ -1427,9 +1496,26 @@ function CompareView({
       endDate,
       createdAt: new Date().toISOString(),
       preferences,
+      activityPlan,
     });
     setSaved(true);
     window.setTimeout(() => setSaved(false), 2200);
+  };
+
+  const shareCurrentTrip = async () => {
+    try {
+      const status = await shareTripLink({
+        name: locations.map((place) => place.name).join(" · "),
+        locations,
+        startDate,
+        endDate,
+        preferences,
+        activityPlan,
+      });
+      setShareStatus(status);
+    } catch {
+      setShareStatus("The share link could not be created.");
+    }
   };
 
   return (
@@ -1474,8 +1560,18 @@ function CompareView({
             {saved ? <Check size={17} /> : <Heart size={17} />}
             {saved ? "Trip saved" : "Save trip"}
           </button>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={!locations.length}
+            onClick={() => void shareCurrentTrip()}
+          >
+            <Share2 size={17} /> Share trip
+          </button>
         </div>
       </section>
+
+      {shareStatus && <p className="share-status" role="status" aria-live="polite">{shareStatus}</p>}
 
       <TravelPreferencesPanel
         preferences={preferences}
@@ -1483,8 +1579,36 @@ function CompareView({
         activeTripId={activeTripId}
         onChange={onPreferencesChange}
         onSaveDefault={onSavePreferencesAsDefault}
-        onUpdateTrip={onUpdateTrip}
+        onUpdateTrip={(nextPreferences) => onUpdateTrip(nextPreferences, activityPlan)}
       />
+
+      <section className="activity-plan-panel" aria-label="Activity planning">
+        <div>
+          <span className="section-kicker">Best weather windows</span>
+          <h2>Choose the activity to optimize</h2>
+          <p>Automatic mode follows your travel style. You can override each destination or day below.</p>
+        </div>
+        <label>
+          <span>Trip activity</span>
+          <select
+            value={activityPlan.defaultActivity}
+            onChange={(event) =>
+              onActivityPlanChange({
+                ...activityPlan,
+                defaultActivity: event.target.value as ActivityPlan["defaultActivity"],
+              })
+            }
+          >
+            {(Object.keys(ACTIVITY_LABELS) as Array<keyof typeof ACTIVITY_LABELS>).map(
+              (activity) => (
+                <option key={activity} value={activity}>
+                  {ACTIVITY_LABELS[activity]}
+                </option>
+              ),
+            )}
+          </select>
+        </label>
+      </section>
 
       {!withinRange && (
         <div className="range-notice">
@@ -1608,6 +1732,19 @@ function CompareView({
                 ) : (
                   <p className="no-live-days">Save now and check back closer to departure.</p>
                 )}
+                {selectedDays.length > 0 && (
+                  <>
+                    <WeatherWindowsPanel
+                      snapshot={snapshot}
+                      days={selectedDays}
+                      preferences={preferences}
+                      activityPlan={activityPlan}
+                      onActivityPlanChange={onActivityPlanChange}
+                      compact
+                    />
+                    <PackingList snapshot={snapshot} days={selectedDays} />
+                  </>
+                )}
                 <div className="compare-verdict">
                   {snapshot.risks.length ? (
                     <>
@@ -1652,6 +1789,7 @@ function SavedView({
   onRemove: (place: Location) => void;
   onDeleteTrip: (id: string) => void;
 }) {
+  const [shareStatus, setShareStatus] = useState("");
   return (
     <>
       <section className="saved-intro">
@@ -1723,6 +1861,7 @@ function SavedView({
             New comparison <Plus size={16} />
           </Link>
         </div>
+        {shareStatus && <p className="share-status" role="status" aria-live="polite">{shareStatus}</p>}
         {state.trips.length ? (
           <div className="trip-list">
             {state.trips.map((trip) => {
@@ -1755,6 +1894,18 @@ function SavedView({
                   >
                     Open <ArrowRight size={15} />
                   </Link>
+                  <button
+                    type="button"
+                    className="trip-share"
+                    onClick={() =>
+                      void shareTripLink(trip)
+                        .then(setShareStatus)
+                        .catch(() => setShareStatus("The share link could not be created."))
+                    }
+                    aria-label={`Share trip ${trip.name}`}
+                  >
+                    <Share2 size={16} /> Share
+                  </button>
                   <button
                     type="button"
                     className="icon-button"

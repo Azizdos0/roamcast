@@ -14,6 +14,8 @@ const GEOCODING_URL =
   "https://geocoding-api.open-meteo.com/v1/search";
 const API_KEY = process.env.WEATHER_API_KEY;
 const CACHE_TTL = 10 * 60 * 1000;
+const PROVIDER_TIMEOUT_MS = 20_000;
+const DAILY_BATCH_SIZE = 20;
 
 type CacheEntry<T> = { value: T; expiresAt: number };
 const cache = new Map<string, CacheEntry<unknown>>();
@@ -44,6 +46,13 @@ async function deduped<T>(key: string, work: () => Promise<T>): Promise<T> {
   return request;
 }
 
+function providerFetch(url: URL) {
+  return fetch(url, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+  });
+}
+
 function finite(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
@@ -52,6 +61,32 @@ function item<T>(values: unknown, index: number, fallback: T): T {
   return Array.isArray(values) && values[index] !== undefined
     ? (values[index] as T)
     : fallback;
+}
+
+function normalizeDaily(raw: Record<string, unknown>): DailyForecast[] {
+  return (Array.isArray(raw.time) ? raw.time : []).map(
+    (date: string, index: number) => ({
+      date,
+      weatherCode: finite(item(raw.weather_code, index, 0)),
+      temperatureMax: finite(item(raw.temperature_2m_max, index, 0)),
+      temperatureMin: finite(item(raw.temperature_2m_min, index, 0)),
+      apparentTemperatureMax: finite(
+        item(raw.apparent_temperature_max, index, 0),
+      ),
+      apparentTemperatureMin: finite(
+        item(raw.apparent_temperature_min, index, 0),
+      ),
+      sunrise: String(item(raw.sunrise, index, "")),
+      sunset: String(item(raw.sunset, index, "")),
+      uvIndexMax: finite(item(raw.uv_index_max, index, 0)),
+      precipitation: finite(item(raw.precipitation_sum, index, 0)),
+      precipitationProbability: finite(
+        item(raw.precipitation_probability_max, index, 0),
+      ),
+      windSpeedMax: finite(item(raw.wind_speed_10m_max, index, 0)),
+      windGustsMax: finite(item(raw.wind_gusts_10m_max, index, 0)),
+    }),
+  );
 }
 
 export function locationId(latitude: number, longitude: number): string {
@@ -123,9 +158,7 @@ export async function searchLocations(
     url.searchParams.set("format", "json");
     if (API_KEY) url.searchParams.set("apikey", API_KEY);
 
-    const response = await fetch(url, {
-      headers: { accept: "application/json" },
-    });
+    const response = await providerFetch(url);
     if (!response.ok) throw new Error(`LOCATION_PROVIDER_${response.status}`);
     const payload = (await response.json()) as {
       results?: Array<Record<string, unknown>>;
@@ -181,6 +214,7 @@ export async function getWeather(
       [
         "temperature_2m",
         "apparent_temperature",
+        "uv_index",
         "precipitation_probability",
         "precipitation",
         "weather_code",
@@ -209,9 +243,7 @@ export async function getWeather(
     );
     if (API_KEY) url.searchParams.set("apikey", API_KEY);
 
-    const response = await fetch(url, {
-      headers: { accept: "application/json" },
-    });
+    const response = await providerFetch(url);
     if (!response.ok) throw new Error(`WEATHER_PROVIDER_${response.status}`);
     const raw = (await response.json()) as {
       timezone?: unknown;
@@ -234,6 +266,7 @@ export async function getWeather(
       apparentTemperature: finite(
         item(hourlyRaw.apparent_temperature, index, 0),
       ),
+      uvIndex: finite(item(hourlyRaw.uv_index, index, 0)),
       precipitationProbability: finite(
         item(hourlyRaw.precipitation_probability, index, 0),
       ),
@@ -245,29 +278,7 @@ export async function getWeather(
       windGusts: finite(item(hourlyRaw.wind_gusts_10m, index, 0)),
     }));
 
-    const daily: DailyForecast[] = (
-      Array.isArray(dailyRaw.time) ? dailyRaw.time : []
-    ).map((date: string, index: number) => ({
-      date,
-      weatherCode: finite(item(dailyRaw.weather_code, index, 0)),
-      temperatureMax: finite(item(dailyRaw.temperature_2m_max, index, 0)),
-      temperatureMin: finite(item(dailyRaw.temperature_2m_min, index, 0)),
-      apparentTemperatureMax: finite(
-        item(dailyRaw.apparent_temperature_max, index, 0),
-      ),
-      apparentTemperatureMin: finite(
-        item(dailyRaw.apparent_temperature_min, index, 0),
-      ),
-      sunrise: String(item(dailyRaw.sunrise, index, "")),
-      sunset: String(item(dailyRaw.sunset, index, "")),
-      uvIndexMax: finite(item(dailyRaw.uv_index_max, index, 0)),
-      precipitation: finite(item(dailyRaw.precipitation_sum, index, 0)),
-      precipitationProbability: finite(
-        item(dailyRaw.precipitation_probability_max, index, 0),
-      ),
-      windSpeedMax: finite(item(dailyRaw.wind_speed_10m_max, index, 0)),
-      windGustsMax: finite(item(dailyRaw.wind_gusts_10m_max, index, 0)),
-    }));
+    const daily = normalizeDaily(dailyRaw);
 
     return {
       location,
@@ -294,5 +305,86 @@ export async function getWeather(
       risks: deriveTravelRisks(daily),
       fetchedAt: new Date().toISOString(),
     };
+  });
+}
+
+export type DailyWeatherSnapshot = {
+  location: Location;
+  timezone: string;
+  daily: DailyForecast[];
+  risks: TravelRisk[];
+  fetchedAt: string;
+};
+
+export async function getDailyWeatherBatch(
+  locations: Location[],
+  forecastDays = 16,
+): Promise<DailyWeatherSnapshot[]> {
+  if (!locations.length) return [];
+  const days = Math.max(1, Math.min(16, forecastDays));
+  const key = `daily-batch:${locations.map((location) => location.id).join("|")}:${days}`;
+  return deduped(key, async () => {
+    const batches = Array.from(
+      { length: Math.ceil(locations.length / DAILY_BATCH_SIZE) },
+      (_, index) => locations.slice(index * DAILY_BATCH_SIZE, (index + 1) * DAILY_BATCH_SIZE),
+    );
+    const results = await Promise.all(
+      batches.map(async (batch) => {
+        const url = new URL(FORECAST_URL);
+        url.searchParams.set(
+          "latitude",
+          batch.map((location) => location.latitude).join(","),
+        );
+        url.searchParams.set(
+          "longitude",
+          batch.map((location) => location.longitude).join(","),
+        );
+        url.searchParams.set("timezone", "auto");
+        url.searchParams.set("forecast_days", String(days));
+        url.searchParams.set(
+          "daily",
+          [
+            "weather_code",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "apparent_temperature_max",
+            "apparent_temperature_min",
+            "sunrise",
+            "sunset",
+            "uv_index_max",
+            "precipitation_sum",
+            "precipitation_probability_max",
+            "wind_speed_10m_max",
+            "wind_gusts_10m_max",
+          ].join(","),
+        );
+        if (API_KEY) url.searchParams.set("apikey", API_KEY);
+        const response = await providerFetch(url);
+        if (!response.ok) throw new Error(`WEATHER_PROVIDER_${response.status}`);
+        const payload = (await response.json()) as
+          | Array<Record<string, unknown>>
+          | Record<string, unknown>;
+        const rows = Array.isArray(payload) ? payload : [payload];
+        if (rows.length !== batch.length) {
+          throw new Error("WEATHER_PROVIDER_LOCATION_MISMATCH");
+        }
+        const fetchedAt = new Date().toISOString();
+        return rows.map((raw, index) => {
+          const daily = normalizeDaily(
+            raw.daily && typeof raw.daily === "object"
+              ? (raw.daily as Record<string, unknown>)
+              : {},
+          );
+          return {
+            location: batch[index],
+            timezone: String(raw.timezone ?? batch[index].timezone ?? "UTC"),
+            daily,
+            risks: deriveTravelRisks(daily),
+            fetchedAt,
+          };
+        });
+      }),
+    );
+    return results.flat();
   });
 }
